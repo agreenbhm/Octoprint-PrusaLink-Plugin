@@ -1,0 +1,83 @@
+<h3>{{ _('PrusaLink Connector') }}</h3>
+<p>
+    Connect OctoPrint to a Prusa printer over its local PrusaLink API. After saving, pick the
+    <code>PRUSALINK</code> serial port in the Connection panel (any baud rate).
+</p>
+
+<form class="form-horizontal" onsubmit="return false;">
+    <div class="control-group">
+        <label class="control-label">{{ _('Printer host / IP') }}</label>
+        <div class="controls">
+            <input type="text" class="input-block-level" placeholder="192.168.1.50 or http://mk4.local:80" data-bind="value: settings.plugins.prusalink.host">
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">{{ _('Username') }}</label>
+        <div class="controls">
+            <input type="text" class="input-medium" data-bind="value: settings.plugins.prusalink.username">
+            <span class="help-inline">{{ _('Digest auth user, usually "maker"') }}</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">{{ _('Password') }}</label>
+        <div class="controls">
+            <input type="password" class="input-medium" autocomplete="new-password" data-bind="value: settings.plugins.prusalink.password">
+            <span class="help-inline">{{ _('Printer display: Settings → Network → PrusaLink') }}</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">{{ _('API key (legacy)') }}</label>
+        <div class="controls">
+            <input type="password" class="input-medium" autocomplete="off" data-bind="value: settings.plugins.prusalink.api_key">
+            <span class="help-inline">{{ _('Only for older firmware using X-Api-Key. Overrides user/password.') }}</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <div class="controls">
+            <label class="checkbox"><input type="checkbox" data-bind="checked: settings.plugins.prusalink.use_https"> {{ _('Use HTTPS') }}</label>
+            <label class="checkbox"><input type="checkbox" data-bind="checked: settings.plugins.prusalink.verify_tls"> {{ _('Verify TLS certificate') }}</label>
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">{{ _('Storage') }}</label>
+        <div class="controls">
+            <input type="text" class="input-small" placeholder="auto" data-bind="value: settings.plugins.prusalink.storage">
+            <span class="help-inline">{{ _('e.g. usb, local, sdcard. Blank = first writable.') }}</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">{{ _('Poll interval') }}</label>
+        <div class="controls">
+            <div class="input-append">
+                <input type="number" step="0.5" min="0.5" class="input-mini" data-bind="value: settings.plugins.prusalink.poll_interval">
+                <span class="add-on">s</span>
+            </div>
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">{{ _('Request timeout') }}</label>
+        <div class="controls">
+            <div class="input-append">
+                <input type="number" step="1" min="1" class="input-mini" data-bind="value: settings.plugins.prusalink.request_timeout">
+                <span class="add-on">s</span>
+            </div>
+        </div>
+    </div>
+    <div class="control-group">
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.prusalink.redirect_local_prints">
+                {{ _('Printing a file from OctoPrint storage uploads it to the printer and prints from there') }}
+            </label>
+            <span class="help-block">{{ _('Requires an OctoPrint restart to change whether the redirect is installed.') }}</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <div class="controls">
+            <button class="btn" data-bind="click: testConnection, enable: !testing()">
+                <i class="fa fa-spinner fa-spin" data-bind="visible: testing"></i> {{ _('Test connection') }}
+            </button>
+            <span data-bind="text: testResult, css: {'text-success': testOk(), 'text-error': !testOk()}"></span>
+        </div>
+    </div>
+</form>
