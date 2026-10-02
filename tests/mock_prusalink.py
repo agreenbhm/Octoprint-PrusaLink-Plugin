@@ -5,11 +5,45 @@ Tiny PrusaLink v1 API simulator for development and tests.
 
 Files are kept in memory under storage "usb" with Buddy-style short names (SFN) plus a
 display name, so the SFN/LFN mapping is exercised. A started job advances progress by
-``--step`` percent per status request.
+``--step`` percent per status request, unless the file has slicer layer markers: then it
+is "executed" in wall-clock time (``layer_time`` per layer, G4 dwell inside timelapse park
+blocks) and status reports axis_z and the M220 speed like Buddy firmware does
+(no axis_x/axis_y while printing).
 """
+
+
+def build_timeline(data, layer_time):
+    """[(duration_s, z, speed)] from G-code text, or None if it has no layer markers."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    segs, z, speed, in_park, park = [], 0.0, 100, False, None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(";PRUSALINK_TIMELAPSE_BEGIN"):
+            in_park, park = True, {"speed": speed, "dwell": 0.0}
+        elif line.startswith(";PRUSALINK_TIMELAPSE_END"):
+            in_park = False
+            # travel to park, then dwell at the marker speed
+            segs.append((0.2, z + 1.0, 100))
+            segs.append((park["dwell"], z + 1.0, park["speed"]))
+            segs.append((0.2, z, 100))
+        elif in_park:
+            m = re.match(r"M220 S(\d+)", line)
+            if m:
+                park["speed"] = int(m.group(1))
+            m = re.match(r"G4 P(\d+)", line)
+            if m:
+                park["dwell"] = int(m.group(1)) / 1000.0
+        elif line.startswith(";Z:"):
+            z = float(line[3:])
+            segs.append((layer_time, z, 100))
+    return segs or None
 
 import argparse
 import json
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,14 +51,17 @@ from urllib.parse import unquote, urlparse
 
 
 class PrinterSim:
-    def __init__(self, step=10.0):
+    def __init__(self, step=10.0, layer_time=1.0):
         self.lock = threading.Lock()
         self.step = step
+        self.layer_time = layer_time
         self.state = "IDLE"
         self.job = None  # dict(id, file, progress)
         self.next_job_id = 100
         self.files = {}  # sfn -> dict(display, data, m_timestamp)
         self.requests = []  # (method, path)
+        self.snapshot = b""  # served at /snapshot.jpg (no auth, like a webcam)
+        self.snapshot_count = 0
 
     def _sfn(self, display):
         base, _, ext = display.rpartition(".")
@@ -58,17 +95,40 @@ class PrinterSim:
         with self.lock:
             if self.job is not None and self.state in ("PRINTING", "PAUSED"):
                 return False
-            self.job = {"id": self.next_job_id, "file": sfn, "progress": 0.0}
+            timeline = build_timeline(self.files[sfn]["data"], self.layer_time)
+            self.job = {"id": self.next_job_id, "file": sfn, "progress": 0.0, "timeline": timeline,
+                        "elapsed": 0.0, "last": time.monotonic(), "z": 0.2, "speed": 100}
             self.next_job_id += 1
             self.state = "PRINTING"
             return True
 
     def tick(self):
         with self.lock:
-            if self.job and self.state == "PRINTING":
-                self.job["progress"] = min(100.0, self.job["progress"] + self.step)
-                if self.job["progress"] >= 100.0:
+            job = self.job
+            if not job:
+                return
+            now = time.monotonic()
+            dt, job["last"] = now - job["last"], now
+            if self.state != "PRINTING":
+                return
+            timeline = job.get("timeline")
+            if not timeline:
+                job["progress"] = min(100.0, job["progress"] + self.step)
+                if job["progress"] >= 100.0:
                     self.state = "FINISHED"
+                return
+            job["elapsed"] += dt
+            total = sum(d for d, _, _ in timeline)
+            t = 0.0
+            for d, z, speed in timeline:
+                if job["elapsed"] < t + d:
+                    job["z"], job["speed"] = z, speed
+                    break
+                t += d
+            else:
+                self.state = "FINISHED"
+                job["speed"] = 100
+            job["progress"] = min(100.0, 100.0 * job["elapsed"] / total)
 
     def status(self):
         self.tick()
@@ -80,12 +140,14 @@ class PrinterSim:
                     "target_nozzle": 215.0 if self.state == "PRINTING" else 0.0,
                     "temp_bed": 60.2 if self.state == "PRINTING" else 23.5,
                     "target_bed": 60.0 if self.state == "PRINTING" else 0.0,
-                    "axis_z": 1.2,
-                    "axis_x": 10.0,
-                    "axis_y": 20.0,
+                    "axis_z": self.job["z"] if self.job else 1.2,
+                    "speed": self.job["speed"] if self.job else 100,
                 },
                 "storage": {"name": "usb", "path": "/usb/", "read_only": False},
             }
+            if self.state != "PRINTING":
+                # like Buddy: x/y only when not printing
+                s["printer"]["axis_x"], s["printer"]["axis_y"] = 10.0, 20.0
             if self.job:
                 s["job"] = {
                     "id": self.job["id"],
@@ -139,6 +201,14 @@ def make_handler(sim, api_key=None):
         def _route(self, method):
             path = unquote(urlparse(self.path).path)
             sim.requests.append((method, path))
+            if method == "GET" and path == "/snapshot.jpg":
+                sim.snapshot_count += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(sim.snapshot)))
+                self.end_headers()
+                self.wfile.write(sim.snapshot)
+                return
             if not self._auth():
                 return
             body = b""
@@ -221,8 +291,8 @@ def make_handler(sim, api_key=None):
     return Handler
 
 
-def serve(port=0, api_key=None, step=10.0):
-    sim = PrinterSim(step=step)
+def serve(port=0, api_key=None, step=10.0, layer_time=1.0):
+    sim = PrinterSim(step=step, layer_time=layer_time)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(sim, api_key))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, sim

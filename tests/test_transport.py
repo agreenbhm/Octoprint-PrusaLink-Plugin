@@ -114,3 +114,30 @@ def test_m28_m29_fallback_upload(printer):
     cmd(t, "M29", until="Done saving file.")
     assert sim.files[sim.find("streamed.gcode")]["data"] == b"G28\nG1 X10\n"
     t.close()
+
+
+def test_quick_pause_resume_does_not_leave_printer_paused(printer):
+    server, sim = printer
+    sim.add_file("a.gcode", b"G28\n" * 1000)
+    sim.step = 2.0
+    t = make(server)
+    sim.start("A~1.GCO")
+    t._update_status(t._client.status())
+    # resume before the deferred pause fired
+    cmd(t, "M25")
+    cmd(t, "M24")
+    time.sleep(1.5)
+    assert sim.state == "PRINTING"
+    # the reported SD position must keep advancing (it's frozen while a pause is pending)
+    t._update_status(t._client.status())
+    first = t._sd_line()
+    for _ in range(3):
+        t._update_status(t._client.status())
+    assert t._sd_line() != first, first
+    # resume after the pause went out but before the poller saw PAUSED
+    cmd(t, "M25")
+    time.sleep(1.5)
+    assert sim.state == "PAUSED"
+    cmd(t, "M24")
+    assert sim.state == "PRINTING"
+    t.close()

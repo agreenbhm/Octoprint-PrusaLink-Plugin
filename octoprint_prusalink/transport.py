@@ -82,10 +82,15 @@ class PrusaLinkSerial:
 
         # bookkeeping to tell our own actions apart from ones done on the printer
         self._start_requested_at = None
-        self._pause_requested = False
-        self._resume_requested = False
+        # monotonic timestamps of our own pause/resume requests, to tell them apart from
+        # pauses done on the printer; they expire because the poller may never see the
+        # intermediate state (pause + resume within one poll interval)
+        self._pause_req_at = None
+        self._resume_req_at = None
         self._stop_requested = False
         self._pending_pause = None  # threading.Timer
+        self._pause_token = 0  # bumped to invalidate a pending deferred pause
+        self._control_lock = threading.Lock()  # serializes pause/resume/start API calls
         self._attention_reported = False
         self._sd_initialized = False
         self._pending_announce = None
@@ -98,6 +103,7 @@ class PrusaLinkSerial:
 
         self._warned = set()
         self._threads = []
+        self._status_listeners = []
 
     # ~~ serial-like interface used by octoprint.util.comm
 
@@ -209,6 +215,24 @@ class PrusaLinkSerial:
     def time_remaining(self):
         with self._lock:
             return self._time_remaining if self._job_id is not None else None
+
+    @property
+    def poll_interval(self):
+        return self._poll_interval
+
+    @poll_interval.setter
+    def poll_interval(self, value):
+        self._poll_interval = max(0.25, float(value))
+
+    def add_status_listener(self, listener):
+        """listener(status_dict) is called from the poller thread after every poll."""
+        self._status_listeners.append(listener)
+
+    def remove_status_listener(self, listener):
+        try:
+            self._status_listeners.remove(listener)
+        except ValueError:
+            pass
 
     @property
     def printer_name(self):
@@ -374,72 +398,119 @@ class PrusaLinkSerial:
             "ok",
         )
 
+    _REQUEST_WINDOW = 15.0
+
+    def _pause_pending(self):
+        """Lock must be held. True if we asked for a pause that hasn't been superseded."""
+        p, r = self._pause_req_at, self._resume_req_at
+        return (
+            p is not None
+            and time.monotonic() - p < self._REQUEST_WINDOW
+            and (r is None or r < p)
+        )
+
+    def _resume_pending(self):
+        """Lock must be held. True if we asked for a resume that hasn't been superseded."""
+        p, r = self._pause_req_at, self._resume_req_at
+        return (
+            r is not None
+            and time.monotonic() - r < self._REQUEST_WINDOW
+            and (p is None or p < r)
+        )
+
+    def _cancel_pending_pause(self):
+        """Must be called with self._lock held. Returns True if a pause was pending."""
+        self._pause_token += 1
+        if self._pending_pause:
+            self._pending_pause.cancel()
+            self._pending_pause = None
+            return True
+        return False
+
     def _cmd_M24(self, arg):
-        with self._lock:
-            state, job_id, selected = self._state, self._job_id, self._selected
-        try:
-            if job_id is not None and state in ("PAUSED", "ATTENTION"):
-                with self._lock:
-                    self._resume_requested = True
-                self._client.resume_job(job_id)
-            elif job_id is not None:
-                pass  # already printing
-            elif selected is not None:
-                with self._lock:
-                    self._start_requested_at = time.monotonic()
-                    self._stop_requested = False
-                self._client.start_print(self._storage, selected["path"])
-            else:
-                self._send("// PrusaLink: no file selected")
-        except PrusaLinkError as e:
+        with self._control_lock:
             with self._lock:
-                self._start_requested_at = None
-                self._resume_requested = False
-            self._send(f"// PrusaLink: M24 failed: {e}", "ok", "//action:cancel")
-            return
+                if self._cancel_pending_pause():
+                    # resumed before the deferred pause went out: nothing to do
+                    self._send("ok")
+                    return
+                state, job_id, selected = self._state, self._job_id, self._selected
+                paused = state in ("PAUSED", "ATTENTION") or self._pause_pending()
+            try:
+                if job_id is not None and paused:
+                    with self._lock:
+                        self._resume_req_at = time.monotonic()
+                    self._resume_with_retry(job_id)
+                elif job_id is not None:
+                    pass  # already printing
+                elif selected is not None:
+                    with self._lock:
+                        self._start_requested_at = time.monotonic()
+                        self._stop_requested = False
+                    self._client.start_print(self._storage, selected["path"])
+                else:
+                    self._send("// PrusaLink: no file selected")
+            except PrusaLinkError as e:
+                with self._lock:
+                    self._start_requested_at = None
+                    self._resume_req_at = None
+                self._send(f"// PrusaLink: M24 failed: {e}", "ok", "//action:cancel")
+                return
         self._send("ok")
+
+    def _resume_with_retry(self, job_id, attempts=5):
+        # right after a pause request the printer may still be parking (409)
+        for i in range(attempts):
+            try:
+                self._client.resume_job(job_id)
+                return
+            except PrusaLinkError as e:
+                if e.status_code != 409 or i == attempts - 1:
+                    raise
+                time.sleep(1.0)
 
     def _cmd_M25(self, arg):
         # OctoPrint cancels SD prints with M25 + M27 + M26 S0, so pausing is deferred
         # briefly to avoid parking the head right before a stop.
         with self._lock:
-            if self._pending_pause:
-                self._pending_pause.cancel()
-            self._pending_pause = threading.Timer(self._pause_defer, self._do_pause)
+            self._cancel_pending_pause()
+            token = self._pause_token
+            self._pending_pause = threading.Timer(self._pause_defer, self._do_pause, args=(token,))
             self._pending_pause.daemon = True
             self._pending_pause.start()
         self._send("ok")
 
-    def _do_pause(self):
-        with self._lock:
-            self._pending_pause = None
-            job_id, state = self._job_id, self._state
-            starting = self._start_requested_at is not None
-        if job_id is None and starting:
-            # paused right after starting, before the poller saw the job
-            try:
-                job = self._client.job() or {}
-                job_id, state = job.get("id"), job.get("state")
-            except PrusaLinkError:
-                job_id = None
-        if job_id is None or state != "PRINTING":
-            return
-        with self._lock:
-            self._pause_requested = True
-        try:
-            self._client.pause_job(job_id)
-        except PrusaLinkError as e:
+    def _do_pause(self, token):
+        with self._control_lock:
             with self._lock:
-                self._pause_requested = False
-            self._send(f"// PrusaLink: pause failed: {e}")
+                if token != self._pause_token:
+                    return  # superseded by M24 / M26 / another M25
+                self._pending_pause = None
+                job_id, state = self._job_id, self._state
+                starting = self._start_requested_at is not None
+            if job_id is None and starting:
+                # paused right after starting, before the poller saw the job
+                try:
+                    job = self._client.job() or {}
+                    job_id, state = job.get("id"), job.get("state")
+                except PrusaLinkError:
+                    job_id = None
+            if job_id is None or state != "PRINTING":
+                return
+            with self._lock:
+                self._pause_req_at = time.monotonic()
+            try:
+                self._client.pause_job(job_id)
+            except PrusaLinkError as e:
+                with self._lock:
+                    self._pause_req_at = None
+                self._send(f"// PrusaLink: pause failed: {e}")
 
     def _cmd_M26(self, arg):
         m = _param_s.search(arg)
         if m and int(m.group(1)) == 0:
             with self._lock:
-                if self._pending_pause:
-                    self._pending_pause.cancel()
-                    self._pending_pause = None
+                self._cancel_pending_pause()
             self._stop()
         self._send("ok")
 
@@ -584,7 +655,7 @@ class PrusaLinkSerial:
                 total = self._job_size or 1000000
                 paused = (
                     self._state != "PRINTING"
-                    or self._pause_requested
+                    or self._pause_pending()
                     or self._pending_pause is not None
                 )
                 if paused:
@@ -623,6 +694,12 @@ class PrusaLinkSerial:
                 self._update_status(status)
             except Exception:
                 self._logger.exception("Error processing PrusaLink status")
+
+            for listener in list(self._status_listeners):
+                try:
+                    listener(status)
+                except Exception:
+                    self._logger.exception("Error in status listener")
 
             self._send(self._temp_line())
             with self._lock:
@@ -664,13 +741,14 @@ class PrusaLinkSerial:
         if active and prev_job == job_id:
             with self._lock:
                 if prev_state == "PRINTING" and state in ("PAUSED", "ATTENTION"):
-                    if not self._pause_requested:
+                    # a pending resume means this is a stale view of our own pause
+                    if not self._pause_pending() and not self._resume_pending():
                         out.append("//action:paused")
-                    self._pause_requested = False
+                    self._pause_req_at = None
                 elif prev_state in ("PAUSED", "ATTENTION") and state == "PRINTING":
-                    if not self._resume_requested:
+                    if not self._resume_pending():
                         out.append("//action:resumed")
-                    self._resume_requested = False
+                    self._resume_req_at = None
 
         if state == "ATTENTION":
             if not self._attention_reported:
@@ -712,8 +790,8 @@ class PrusaLinkSerial:
             self._start_requested_at = None
             self._stop_requested = False
             if not ours:
-                self._pause_requested = False
-                self._resume_requested = False
+                self._pause_req_at = None
+                self._resume_req_at = None
             if ours and self._selected is not None:
                 self._job_size = self._selected.get("size") or self._job_size
             else:
@@ -751,8 +829,8 @@ class PrusaLinkSerial:
             self._job_progress = 0.0
             self._time_remaining = None
             self._stop_requested = False
-            self._pause_requested = False
-            self._resume_requested = False
+            self._pause_req_at = None
+            self._resume_req_at = None
 
         if state == "FINISHED" or (
             not stopped_by_us and state in ("IDLE", "READY") and last_progress >= 99.5

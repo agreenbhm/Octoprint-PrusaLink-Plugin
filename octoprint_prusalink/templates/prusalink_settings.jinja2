@@ -80,4 +80,107 @@
             <span data-bind="text: testResult, css: {'text-success': testOk(), 'text-error': !testOk()}"></span>
         </div>
     </div>
+
+    <h4>{{ _('Timelapse') }}</h4>
+    <p class="help-block">
+        {{ _('OctoPrint\'s built-in timelapse and Octolapse need G-code streaming, which PrusaLink can\'t do. This records a timelapse itself and renders it into OctoPrint\'s Timelapse tab using OctoPrint\'s webcam and ffmpeg settings. Turn OctoPrint\'s own timelapse off.') }}
+    </p>
+    <div class="control-group">
+        <label class="control-label">{{ _('Mode') }}</label>
+        <div class="controls">
+            <select data-bind="value: settings.plugins.prusalink.timelapse_mode">
+                <option value="off">{{ _('Off') }}</option>
+                <option value="stabilized">{{ _('Stabilized (park head each layer)') }}</option>
+                <option value="layer">{{ _('Layer change (no parking)') }}</option>
+            </select>
+            <span class="help-block">{{ _('Stabilized edits ASCII .gcode as it is uploaded through OctoPrint, adding a park and pause at each layer change. Those files park whenever they are printed, including from the printer screen. Binary .bgcode can\'t be edited.') }}</span>
+        </div>
+    </div>
+    <div data-bind="visible: settings.plugins.prusalink.timelapse_mode() !== 'off'">
+        <div class="control-group">
+            <div class="controls">
+                <label class="checkbox">
+                    <input type="checkbox" data-bind="checked: settings.plugins.prusalink.timelapse_fallback_layer">
+                    {{ _('Files without parks (.bgcode, sent directly to the printer): record on layer change instead') }}
+                </label>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Snapshot URL') }}</label>
+            <div class="controls">
+                <input type="text" class="input-block-level" placeholder="{{ _('blank = OctoPrint snapshot webcam') }}" data-bind="value: settings.plugins.prusalink.timelapse_snapshot_url">
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Fast poll while recording') }}</label>
+            <div class="controls">
+                <div class="input-append">
+                    <input type="number" step="0.25" min="0.25" class="input-mini" data-bind="value: settings.plugins.prusalink.timelapse_poll_interval">
+                    <span class="add-on">s</span>
+                </div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Post roll') }}</label>
+            <div class="controls">
+                <div class="input-append">
+                    <input type="number" step="0.5" min="0" class="input-mini" data-bind="value: settings.plugins.prusalink.timelapse_post_roll">
+                    <span class="add-on">s</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div data-bind="visible: settings.plugins.prusalink.timelapse_mode() === 'stabilized'">
+        <div class="control-group">
+            <label class="control-label">{{ _('Park position X / Y') }}</label>
+            <div class="controls">
+                <input type="number" step="1" class="input-mini" placeholder="auto" data-bind="value: settings.plugins.prusalink.park_x">
+                <input type="number" step="1" class="input-mini" placeholder="auto" data-bind="value: settings.plugins.prusalink.park_y">
+                <span class="help-inline">{{ _('mm. Blank = back right, 10 mm in, from the printer profile') }}</span>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Z lift / retract') }}</label>
+            <div class="controls">
+                <input type="number" step="0.1" min="0" class="input-mini" data-bind="value: settings.plugins.prusalink.park_lift">
+                <input type="number" step="0.1" min="0" class="input-mini" data-bind="value: settings.plugins.prusalink.park_retract">
+                <span class="help-inline">mm</span>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Travel / Z / retract speed') }}</label>
+            <div class="controls">
+                <input type="number" step="100" min="1" class="input-mini" data-bind="value: settings.plugins.prusalink.park_travel_speed">
+                <input type="number" step="10" min="1" class="input-mini" data-bind="value: settings.plugins.prusalink.park_z_speed">
+                <input type="number" step="100" min="1" class="input-mini" data-bind="value: settings.plugins.prusalink.park_retract_speed">
+                <span class="help-inline">mm/min</span>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Pause while parked') }}</label>
+            <div class="controls">
+                <div class="input-append">
+                    <input type="number" step="100" min="500" class="input-mini" data-bind="value: settings.plugins.prusalink.park_dwell_ms">
+                    <span class="add-on">ms</span>
+                </div>
+                <span class="help-inline">{{ _('Must be longer than the fast poll interval plus snapshot time') }}</span>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Every N layers') }}</label>
+            <div class="controls">
+                <input type="number" step="1" min="1" class="input-mini" data-bind="value: settings.plugins.prusalink.park_every_n_layers">
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="control-label">{{ _('Marker speed') }}</label>
+            <div class="controls">
+                <div class="input-append">
+                    <input type="number" step="1" min="10" max="255" class="input-mini" data-bind="value: settings.plugins.prusalink.park_marker_speed">
+                    <span class="add-on">%</span>
+                </div>
+                <span class="help-inline">{{ _('M220 value set while parked so the plugin can tell the head is parked; restored after. Don\'t use this speed yourself.') }}</span>
+            </div>
+        </div>
+    </div>
 </form>

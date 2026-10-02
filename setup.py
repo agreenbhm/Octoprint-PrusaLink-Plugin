@@ -3,7 +3,7 @@ import setuptools
 plugin_identifier = "prusalink"
 plugin_package = "octoprint_prusalink"
 plugin_name = "OctoPrint-PrusaLink"
-plugin_version = "0.1.0"
+plugin_version = "0.2.0"
 plugin_description = (
     "Connect OctoPrint to Prusa printers over the local PrusaLink HTTP API "
     "instead of a USB serial connection"

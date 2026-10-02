@@ -59,6 +59,14 @@ def main():
     }
     cfg["plugins"]["tracking"] = {"enabled": False}
     cfg.setdefault("serial", {})["log"] = True
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        cfg.setdefault("webcam", {})["ffmpeg"] = ffmpeg
+        cfg["webcam"].setdefault("timelapse", {})["fps"] = 10
+        sim.snapshot = subprocess.run(
+            [ffmpeg, "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=64x48",
+             "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-"],
+            check=True, capture_output=True).stdout
     cfg["plugins"]["_disabled"] = ["tracking", "announcements", "softwareupdate", "pluginmanager"]
     yaml.safe_dump(cfg, open(cfg_path, "w"))
 
@@ -128,7 +136,11 @@ def main():
         wait_for(lambda: sim.state == "PRINTING", 15, what="printer resumed")
         wait_for(lambda: state()["state"].startswith("Printing"), 15, what="OctoPrint resumed")
         print("resumed ok")
-        eta = wait_for(lambda: state()["progress"]["printTimeLeftOrigin"] == "estimate" and state()["progress"], 15, what="printer ETA")
+        try:
+            eta = wait_for(lambda: state()["progress"]["printTimeLeftOrigin"] == "estimate" and state()["progress"], 15, what="printer ETA")
+        except AssertionError:
+            print("DEBUG", state(), sim.state, sim.job)
+            raise
         print("eta from printer:", eta["printTimeLeft"])
         mark = len(sim.requests)
         s.post(base + "/api/job", json={"command": "cancel"})
@@ -180,11 +192,69 @@ def main():
             wait_for(lambda: state()["state"].startswith(expect), 30, what=f"picked up {pre_state} job on connect")
             print(f"connect while {pre_state}: {state()['state']} {state()['job']['file']['name']}")
 
+        # 8) stabilized timelapse: parks injected at upload, frames captured while parked,
+        #    rendered by OctoPrint into the timelapse folder
+        s.post(base + "/api/connection", json={"command": "disconnect"})
+        wait_for(lambda: state()["state"] in ("Offline", "Closed"), 15, what="disconnected")
+        with sim.lock:
+            sim.state = "IDLE"
+            sim.job = None
+        sim.layer_time = 0.6
+        r = s.post(base + "/api/settings", json={"plugins": {"prusalink": {
+            "timelapse_mode": "stabilized",
+            "timelapse_snapshot_url": f"http://127.0.0.1:{pl_port}/snapshot.jpg",
+            "park_dwell_ms": 1500,
+            "timelapse_post_roll": 0,
+        }}})
+        assert r.ok, r.text
+        s.post(base + "/api/connection", json={"command": "connect", "port": "PRUSALINK", "baudrate": 115200})
+        wait_for(lambda: state()["state"].startswith("Operational"), 30, what="Operational for timelapse")
+
+        layers = 6
+        gcode = "G90\nM83\nG28\nG1 Z0.2 F720\n"
+        for i in range(layers):
+            z = round(0.2 * (i + 1), 2)
+            gcode += f";LAYER_CHANGE\n;Z:{z}\nG1 Z{z} F720\nG1 X10 Y10 F9000\nG1 X50 Y10 E2 F1500\nG1 X50 Y50 E2\n"
+        snaps_before = sim.snapshot_count
+        r = s.post(base + "/api/files/local", files={"file": ("tl test.gcode", gcode.encode())},
+                   data={"select": "true", "print": "true"})
+        assert r.status_code == 201, r.text
+        wait_for(lambda: sim.find("tl_test.gcode"), 30, what="timelapse upload")
+        uploaded = sim.files[sim.find("tl_test.gcode")]["data"].decode()
+        assert uploaded.count(";PRUSALINK_TIMELAPSE_BEGIN") == layers - 1, uploaded
+        wait_for(lambda: state()["state"].startswith("Printing"), 30, what="timelapse print started")
+        wait_for(lambda: state()["state"].startswith("Operational"), 60, what="timelapse print done")
+        frames = sim.snapshot_count - snaps_before
+        print(f"timelapse frames captured: {frames} (parks: {layers - 1}, +1 final)")
+        assert frames == layers, frames
+        if ffmpeg:
+            movie = wait_for(
+                lambda: [f for f in s.get(base + "/api/timelapse").json()["files"]
+                         if f["name"].startswith("tl_test") and f["name"].endswith(".mp4")],
+                60, what="rendered timelapse")
+            print("timelapse rendered:", movie[0]["name"], movie[0]["size"])
+        else:
+            print("ffmpeg not found, skipped render check")
+
         print("E2E PASSED")
     finally:
         proc.terminate()
         proc.wait(20)
         server.shutdown()
+
+
+def _find_ffmpeg():
+    import shutil
+
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
 
 def _ok(s, url):
